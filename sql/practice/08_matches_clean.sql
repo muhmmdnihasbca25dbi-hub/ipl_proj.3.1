@@ -8,7 +8,8 @@ SELECT m.match_id,                      -- the key
        s.season_year,                   -- from Fix 6
        m.result,                        -- for the win rule
        m.match_winner,                  -- unchanged
-       m.player_of_match,              -- unchanged
+       m.player_of_match, 
+       m.toss_winner,                   -- unchanged
        m.toss_decision                  -- unchanged
 FROM   v_matches_venue m                -- 1212 rows
 JOIN   v_city_clean c ON c.match_id = m.match_id
