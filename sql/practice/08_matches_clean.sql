@@ -6,6 +6,8 @@ SELECT m.match_id,                      -- the key
        m.venue_clean,                   -- from Fix 3
        c.city_clean,                    -- from Fix 5
        s.season_year,                   -- from Fix 6
+       m.team1,                          -- participating teams
+       m.team2,
        m.result,                        -- for the win rule
        m.match_winner,                  -- unchanged
        m.player_of_match, 
