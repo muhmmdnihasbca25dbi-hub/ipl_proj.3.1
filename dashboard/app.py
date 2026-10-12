@@ -1,226 +1,111 @@
-import math
-import sqlite3
-from html import escape
+import sqlite3                  # the same driver the notebooks use
 from pathlib import Path
-from typing import Any, cast
 
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+import pandas as pd             # only to hold the rows a query returns
+import plotly.express as px     # every chart on the page is drawn with this
+import streamlit as st          # the page itself
+
+st.set_page_config(page_title="IPL Match Analytics", page_icon="🏏", layout="wide")
 
 
 # -----------------------------------------------------------------------------
-# Page setup
+# Database + one query helper
 # -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="IPL Cricket Analytics — Matches",
-    page_icon="🏏",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
+# Use the database path tracked in the repository (Linux deployments are
+# case-sensitive and do not contain the local data/raw copy).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_CANDIDATES = [
-    PROJECT_ROOT / "data" / "ipl.db",
-    PROJECT_ROOT / "data" / "raw" / "ipl.db",
-    PROJECT_ROOT / "data" / "processed" / "ipl.db",
-]
-DB = next((path for path in DB_CANDIDATES if path.exists()), DB_CANDIDATES[0])
-
-
-# -----------------------------------------------------------------------------
-# SQLite helpers
-# All dashboard numbers come from SQL through q().
-# -----------------------------------------------------------------------------
-def _binom_two_sided(k, n, p):
-    """Exact two-sided binomial p-value, used inside SQLite SQL."""
-    if n <= 0 or k < 0 or k > n:
-        return None
-    if not 0 <= p <= 1:
-        return None
-
-    # For p=0.5, calculate the two-sided exact probability by recurrence.
-    # The dashboard's tested finding uses H0: chase probability = 0.5.
-    if p == 0.5:
-        log2 = math.log(2.0)
-        logs = []
-        for x in range(n + 1):
-            logs.append(
-                math.lgamma(n + 1)
-                - math.lgamma(x + 1)
-                - math.lgamma(n - x + 1)
-                - n * log2
-            )
-        observed = logs[k]
-        total = sum(math.exp(v) for v in logs if v <= observed + 1e-12)
-        return min(1.0, total)
-
-    # General fallback.
-    logs = []
-    for x in range(n + 1):
-        if p in (0, 1):
-            prob = 1.0 if ((p == 1 and x == n) or (p == 0 and x == 0)) else 0.0
-            logs.append(math.log(prob) if prob else -math.inf)
-        else:
-            logs.append(
-                math.lgamma(n + 1)
-                - math.lgamma(x + 1)
-                - math.lgamma(n - x + 1)
-                + x * math.log(p)
-                + (n - x) * math.log1p(-p)
-            )
-    observed = logs[k]
-    return min(1.0, sum(math.exp(v) for v in logs if v <= observed + 1e-12))
-
-
-def _wilson_low(k, n, z=1.959963984540054):
-    if n <= 0:
-        return None
-    p = k / n
-    den = 1 + z * z / n
-    centre = p + z * z / (2 * n)
-    spread = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
-    return (centre - spread) / den
-
-
-def _wilson_high(k, n, z=1.959963984540054):
-    if n <= 0:
-        return None
-    p = k / n
-    den = 1 + z * z / n
-    centre = p + z * z / (2 * n)
-    spread = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
-    return (centre + spread) / den
+DB = PROJECT_ROOT / "data" / "ipl.db"
+SQL_BUILD_SCRIPTS = (
+    "01_null_and_blanket.sql",
+    "02_merge_categories.sql",
+    "03_venue_names.sql",
+    "04_dedupe_venues.sql",
+    "05_city_fallback.sql",
+    "06_season_year.sql",
+    "08_matches_clean.sql",
+    "09_analysis_views.sql",
+)
 
 
 @st.cache_resource
-
-def get_connection():
-    if not DB.exists():
+def initialize_database():
+    if not DB.is_file():
         raise FileNotFoundError(
-            f"Database not found at {DB}. Put ipl.db in the project's data/ folder."
+            f"IPL database not found at {DB}. Ensure data/ipl.db is included in the deployment."
         )
-    conn = sqlite3.connect(DB, check_same_thread=False)
-    conn.create_function("binom_pvalue", 3, _binom_two_sided)
-    conn.create_function("wilson_low", 2, _wilson_low)
-    conn.create_function("wilson_high", 2, _wilson_high)
-    return conn
+
+    sql_dir = PROJECT_ROOT / "sql" / "practice"
+    scripts = [sql_dir / name for name in SQL_BUILD_SCRIPTS]
+    missing_scripts = [path for path in scripts if not path.is_file()]
+    if missing_scripts:
+        paths = ", ".join(str(path) for path in missing_scripts)
+        raise FileNotFoundError(f"Required database setup SQL file(s) not found: {paths}")
+
+    required_objects = {"matches_clean", "v_ball", "v_innings", "v_match_totals"}
+    with sqlite3.connect(DB) as con:
+        existing_objects = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
+        }
+        if not required_objects.issubset(existing_objects):
+            for path in scripts:
+                con.executescript(path.read_text(encoding="utf-8"))
 
 
-@st.cache_data(ttl=300)
-def q(sql, params=()):
-    conn = get_connection()
-    return pd.read_sql_query(sql, conn, params=params)
+initialize_database()
+
+
+@st.cache_data                  # run each query once, not on every click
+def q(sql, params=()):          # one helper for every query on the page
+    with sqlite3.connect(DB) as con:        # opened and closed per call
+        return pd.read_sql_query(sql, con, params=params)
 
 
 # -----------------------------------------------------------------------------
-# Common query helpers
+# Sidebar filters (these control EVERYTHING on the page)
 # -----------------------------------------------------------------------------
-def season_clause(column, seasons):
-    """Return a parameterized season predicate and its parameters."""
-    if not seasons:
-        return "1 = 0", []
-    placeholders = ",".join("?" for _ in seasons)
-    return f"{column} IN ({placeholders})", list(seasons)
+bounds = q("SELECT MIN(season_year) AS lo, MAX(season_year) AS hi FROM matches_clean").iloc[0]
+first_season, last_season = int(bounds["lo"]), int(bounds["hi"])
 
+with st.sidebar:
+    st.header("Filters")
 
-def fmt_int(value):
-    return f"{int(round(value)):,}"
-
-
-def fmt_float(value, digits=2):
-    return f"{float(value):.{digits}f}"
-
-
-def as_int(value: Any) -> int:
-    return int(cast(int, value)) if value is not None else 0
-
-
-def as_float(value: Any) -> float:
-    return float(cast(float, value)) if value is not None else 0.0
-
-
-STAT_CARD_CSS = """
-<style>
-div[data-testid="stHorizontalBlock"] > div {
-    align-items: stretch !important;
-}
-.stat-card {
-    display: flex;
-    flex-direction: column;
-    justify-content: flex-start;
-    align-items: flex-start;
-    height: 100%;
-    min-height: 110px;
-    padding: 0.75rem 0.85rem;
-    border-radius: 0.75rem;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.02);
-    box-sizing: border-box;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-wrap: break-word;
-}
-.stat-label {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.65);
-    line-height: 1.2;
-    letter-spacing: 0.02em;
-    margin-bottom: 0.35rem;
-}
-.stat-value {
-    font-size: clamp(1.1rem, 2vw, 1.8rem);
-    font-weight: 700;
-    line-height: 1.2;
-    color: #f0f2f6;
-    white-space: normal;
-    word-wrap: break-word;
-    overflow-wrap: anywhere;
-    max-width: 100%;
-}
-</style>
-"""
-
-
-def render_stat(label: str, value: str):
-    if not getattr(st, "_stat_cards_css_loaded", False):
-        st.markdown(STAT_CARD_CSS, unsafe_allow_html=True)
-        st._stat_cards_css_loaded = True
-
-    st.markdown(
-        """
-        <div class="stat-card">
-            <div class="stat-label">{label}</div>
-            <div class="stat-value">{value}</div>
-        </div>
-        """.format(
-            label=escape(str(label)),
-            value=escape(str(value)),
-        ),
-        unsafe_allow_html=True,
+    lo, hi = st.select_slider(
+        "Season",
+        options=list(range(first_season, last_season + 1)),
+        value=(first_season, last_season),
     )
 
+    teams = q("""
+        SELECT team1 AS t FROM matches_clean
+        UNION
+        SELECT team2 FROM matches_clean
+        ORDER BY t
+    """)["t"].dropna()
+
+    team = st.selectbox("Team", ["All teams"] + list(teams))
+
+
+# Every query below uses these two pieces, so the filters apply everywhere.
+# "m" is always the alias for matches_clean in the queries.
+WHERE = "m.season_year BETWEEN ? AND ?"
+PARAMS = (lo, hi)
+if team != "All teams":
+    WHERE += " AND (m.team1 = ? OR m.team2 = ?)"
+    PARAMS = (lo, hi, team, team)
+
 
 # -----------------------------------------------------------------------------
-# Dashboard title / reader sentence
+# Title
 # -----------------------------------------------------------------------------
 st.title("IPL Match Analytics")
 st.caption(
-    "For the match analyst, understanding what happened in a match and what usually happens across the league."
+    "For the match analyst, understanding what happened in a match "
+    "and what usually happens across the league."
 )
 
-try:
-    conn = get_connection()
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
-
-
-# -----------------------------------------------------------------------------
-# Tabs required by Domain C
-# -----------------------------------------------------------------------------
 overview_tab, match_tab = st.tabs(["Overview — Whole Competition", "Match — One Game at a Time"])
 
 
@@ -230,287 +115,136 @@ overview_tab, match_tab = st.tabs(["Overview — Whole Competition", "Match — 
 with overview_tab:
     st.subheader("Overview — the competition across seasons")
 
-    seasons_df = q(
-        """
-        SELECT DISTINCT season_year
-        FROM matches_clean
-        WHERE season_year IS NOT NULL
-        ORDER BY season_year
-        """
-    )
-    all_seasons = seasons_df["season_year"].astype(int).tolist()
-
-    selected_seasons = st.multiselect(
-        "Season filter — matches_clean.season_year",
-        options=all_seasons,
-        default=all_seasons,
-        help="Select one or more seasons. Every filtered visual and the tested card responds to this control.",
-    )
-
-    if not selected_seasons:
-        st.warning("Select at least one season.")
+    n_matches = int(q(f"SELECT COUNT(*) AS n FROM matches_clean m WHERE {WHERE}", PARAMS).iloc[0, 0])
+    if n_matches == 0:
+        st.warning("No matches for this season / team selection.")
         st.stop()
 
-    season_sql, season_params = season_clause("m.season_year", selected_seasons)
+    total_runs = q(f"""
+        SELECT COALESCE(SUM(i.runs), 0) AS total_runs
+        FROM v_innings i
+        JOIN matches_clean m ON m.match_id = i.match_id
+        WHERE {WHERE}
+    """, PARAMS).iloc[0, 0]
 
-    # -------------------------------------------------------------------------
-    # Three metric cards
-    # -------------------------------------------------------------------------
-    scale = q(
-        """
-        SELECT COUNT(*) AS matches,
-               COUNT(DISTINCT season_year) AS seasons
-        FROM matches_clean
-        """
-    ).iloc[0]
-
-    total_runs = q(
-        """
-        SELECT COALESCE(SUM(runs), 0) AS total_runs
-        FROM v_innings
-        """
-    ).iloc[0, 0]
-
-    chase_stats = q(
-        f"""
-        SELECT SUM(mt.chase_won) AS chase_wins,
-               COUNT(*) AS n,
-               100.0 * SUM(mt.chase_won) / NULLIF(COUNT(*), 0) AS chase_rate,
-               100.0 * wilson_low(SUM(mt.chase_won), COUNT(*)) AS ci_low,
-               100.0 * wilson_high(SUM(mt.chase_won), COUNT(*)) AS ci_high,
-               binom_pvalue(SUM(mt.chase_won), COUNT(*), 0.5) AS p_value
+    chase_rate = q(f"""
+        SELECT 100.0 * AVG(mt.chase_won) AS rate
         FROM v_match_totals mt
         JOIN matches_clean m ON m.match_id = mt.match_id
-        WHERE {season_sql}
-        """,
-        season_params,
-    ).iloc[0]
+        WHERE {WHERE}
+    """, PARAMS).iloc[0, 0]
+    chase_rate = float(chase_rate) if chase_rate is not None else 0.0
 
+    # ---- three number cards ----
     c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "Competition scale",
-        fmt_int(scale["matches"]),
-        f"{fmt_int(scale['seasons'])} seasons",
-        help="Static scale card: before any season filter, as required by the specification.",
-    )
-    c2.metric("Total runs in the data", fmt_int(total_runs))
-    c3.metric(
-        "Chase win rate",
-        f"{chase_stats['chase_rate']:.2f}%",
-        f"95% CI {chase_stats['ci_low']:.2f}–{chase_stats['ci_high']:.2f}%",
-    )
-    st.caption(
-        f"Tested finding: exact two-sided binomial test, H₀ = 50% chase wins; "
-        f"n = {fmt_int(chase_stats['n'])}, chase wins = {fmt_int(chase_stats['chase_wins'])}, "
-        f"p = {chase_stats['p_value']:.5f}."
-    )
+    c1.metric("Matches", f"{n_matches:,}")
+    c2.metric("Total runs", f"{int(total_runs):,}")
+    c3.metric("Chase win rate", f"{chase_rate:.1f}%")
 
-    # -------------------------------------------------------------------------
-    # Visual 1 — HERO: average innings score by season
-    # -------------------------------------------------------------------------
-    avg_score = q(
-        f"""
-        SELECT m.season_year,
-               AVG(i.runs) AS avg_score,
-               COUNT(DISTINCT m.match_id) AS match_count
+    # ---- chart 1: average innings score by season (hero) ----
+    avg_score = q(f"""
+        SELECT m.season_year, AVG(i.runs) AS avg_score
         FROM matches_clean m
         JOIN v_innings i ON i.match_id = m.match_id
-        WHERE {season_sql}
+        WHERE {WHERE}
         GROUP BY m.season_year
         ORDER BY m.season_year
-        """,
-        season_params,
-    )
-
-    league_avg = q(
-        f"""
-        SELECT AVG(i.runs) AS league_avg
-        FROM matches_clean m
-        JOIN v_innings i ON i.match_id = m.match_id
-        WHERE {season_sql}
-        """,
-        season_params,
-    ).iloc[0, 0]
+    """, PARAMS)
 
     fig_hero = px.line(
-        avg_score,
-        x="season_year",
-        y="avg_score",
-        markers=True,
+        avg_score, x="season_year", y="avg_score", markers=True,
         labels={"season_year": "Season", "avg_score": "Average innings score"},
     )
-    league_avg_value = as_float(league_avg)
     fig_hero.add_hline(
-        y=league_avg_value,
+        y=float(avg_score["avg_score"].mean()),
         line_dash="dash",
-        annotation_text=f"Selected-period average: {league_avg_value:.1f}",
-        annotation_position="top left",
-    )
-    fig_hero.update_layout(
-        title="Average innings score changes across seasons — line chart, dashed line is the selected-period average",
-        margin=dict(l=20, r=20, t=65, b=20),
-        height=420,
+        annotation_text="average of the selected seasons",
     )
 
-    margin_season_sql, margin_season_params = season_clause("c.season_year", selected_seasons)
-
-    # -------------------------------------------------------------------------
-    # Visual 2 — chase win rate by target band
-    # -------------------------------------------------------------------------
-    target_band = q(
-        f"""
-        SELECT CASE
-                   WHEN mt.first_innings_runs < 140 THEN '<140'
-                   WHEN mt.first_innings_runs < 170 THEN '140–169'
-                   WHEN mt.first_innings_runs < 200 THEN '170–199'
-                   ELSE '200+'
-               END AS target_band,
-               SUM(mt.chase_won) AS chase_wins,
-               COUNT(*) AS match_count,
-               100.0 * SUM(mt.chase_won) / NULLIF(COUNT(*), 0) AS chase_rate
+    # ---- chart 2: chase win rate by target band ----
+    band = q(f"""
+        SELECT CASE WHEN mt.first_innings_runs < 140 THEN '<140'
+                    WHEN mt.first_innings_runs < 170 THEN '140-169'
+                    WHEN mt.first_innings_runs < 200 THEN '170-199'
+                    ELSE '200+' END AS band,
+               COUNT(*) AS matches,
+               ROUND(100.0 * AVG(mt.chase_won), 1) AS chase_pct,
+               MIN(mt.first_innings_runs) AS sort_key
         FROM v_match_totals mt
         JOIN matches_clean m ON m.match_id = mt.match_id
-        WHERE {season_sql}
-        GROUP BY target_band
-        ORDER BY CASE target_band
-                   WHEN '<140' THEN 1
-                   WHEN '140–169' THEN 2
-                   WHEN '170–199' THEN 3
-                   ELSE 4
-                 END
-        """,
-        season_params,
-    )
+        WHERE {WHERE}
+        GROUP BY band
+        ORDER BY sort_key
+    """, PARAMS)
 
-    fig_band = px.bar(
-        target_band,
-        x="target_band",
-        y="chase_rate",
-        text=target_band["chase_rate"].map(lambda x: f"{x:.1f}%"),
-        labels={"target_band": "First-innings target", "chase_rate": "Chase win rate (%)"},
-    )
-    fig_band.add_hline(
-        y=50,
-        line_dash="dash",
-        annotation_text="50% even contest",
-        annotation_position="top left",
-    )
+    fig_band = px.bar(band, x="band", y="chase_pct", text="matches")
+    fig_band.update_traces(textposition="inside", texttemplate="%{text} matches")
+    fig_band.update_xaxes(categoryorder="array", categoryarray=band["band"])
+    fig_band.add_hline(y=50, line_dash="dash", annotation_text="50% = even contest")
     fig_band.update_layout(
-        title="Chasing becomes less successful as the target rises — bar chart, reference = 50%",
-        margin=dict(l=20, r=20, t=65, b=20),
-        height=420,
+        xaxis_title="Target the chasing team faced",
+        yaxis_title="How often the chase won (%)",
+        showlegend=False,
     )
 
-    hero_col, support_col = st.columns([2, 1])
-    with hero_col:
+    left, right = st.columns([2, 1])
+    with left:
+        st.markdown("**Average innings score across seasons**")
         st.plotly_chart(fig_hero, use_container_width=True)
-        st.caption(
-            "n = "
-            + ", ".join(
-                f"{as_int(r.season_year)}: {as_int(r.match_count)} matches" for r in avg_score.itertuples()
-            )
-        )
-    with support_col:
+    with right:
+        st.markdown("**Chasing gets harder as the target rises**")
         st.plotly_chart(fig_band, use_container_width=True)
-        st.caption(
-            "n by target band = "
-            + ", ".join(
-                f"{r.target_band}: {as_int(r.match_count)}" for r in target_band.itertuples()
-            )
-        )
+        st.caption("Bands with few matches can swing a lot; check the match counts.")
 
-    # -------------------------------------------------------------------------
-    # Context row — exactly three additional visuals
-    # -------------------------------------------------------------------------
     st.divider()
-    ctx1, ctx2, ctx3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
 
-    # Visual 3 — sixes by season
-    with ctx1:
-        sixes = q(
-            f"""
-            SELECT m.season_year,
-                   SUM(CASE WHEN d.batter_runs = 6 THEN 1 ELSE 0 END) AS sixes,
-                   COUNT(DISTINCT m.match_id) AS match_count
+    # ---- chart 3: sixes by season ----
+    with col1:
+        sixes = q(f"""
+            SELECT m.season_year, COUNT(*) AS sixes
             FROM deliveries d
             JOIN matches_clean m ON m.match_id = d.match_id
-            WHERE d.is_super_over = 0 AND {season_sql}
+            WHERE d.batter_runs = 6 AND d.is_super_over = 0 AND {WHERE}
             GROUP BY m.season_year
             ORDER BY m.season_year
-            """,
-            season_params,
-        )
-        fig = px.bar(
-            sixes,
-            x="season_year",
-            y="sixes",
-            labels={"season_year": "Season", "sixes": "Sixes"},
-            title="Sixes hit by season — showing how the scoring environment has changed",
-        )
-        fig.update_layout(margin=dict(l=10, r=10, t=65, b=10), height=300)
+        """, PARAMS)
+        fig = px.bar(sixes, x="season_year", y="sixes",
+                     labels={"season_year": "Season", "sixes": "Sixes"})
+        st.markdown("**Sixes hit by season**")
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "n = "
-            + ", ".join(
-                f"{as_int(r.season_year)}: {as_int(r.match_count)} matches" for r in sixes.itertuples()
-            )
-        )
 
-    # Visual 4 — wins by margin
-    with ctx2:
-        margins = q(
-            f"""
-            SELECT CASE
-                     WHEN c.result = 'win' AND m.win_by_runs > 0 THEN 'Wins by runs'
-                     WHEN c.result = 'win' AND m.win_by_wickets > 0 THEN 'Wins by wickets'
-                   END AS margin_type,
-                   COUNT(*) AS match_count
-            FROM matches_clean c
-            JOIN matches m ON m.match_id = c.match_id
-            WHERE {margin_season_sql} AND c.result = 'win'
-            GROUP BY margin_type
-            ORDER BY margin_type
-            """,
-            margin_season_params,
-        )
-        fig = px.bar(
-            margins,
-            x="margin_type",
-            y="match_count",
-            text="match_count",
-            labels={"margin_type": "Winning method", "match_count": "Matches"},
-            title="Winning margins split between runs and wickets",
-        )
-        fig.update_layout(margin=dict(l=10, r=10, t=65, b=10), height=300)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("n = decisive matches in the selected season(s)")
-
-    # Visual 5 — toss decision by season
-    with ctx3:
-        toss = q(
-            f"""
-            SELECT m.season_year,
-                   m.toss_decision,
-                   COUNT(*) AS match_count
+    # ---- chart 4: wins by runs vs wickets ----
+    with col2:
+        margins = q(f"""
+            SELECT CASE WHEN x.win_by_runs > 0 THEN 'Wins by runs'
+                        WHEN x.win_by_wickets > 0 THEN 'Wins by wickets' END AS margin_type,
+                   COUNT(*) AS matches
             FROM matches_clean m
-            WHERE {season_sql}
-            GROUP BY m.season_year, m.toss_decision
-            ORDER BY m.season_year, m.toss_decision
-            """,
-            season_params,
-        )
-        fig = px.bar(
-            toss,
-            x="season_year",
-            y="match_count",
-            color="toss_decision",
-            barmode="stack",
-            labels={"season_year": "Season", "match_count": "Matches", "toss_decision": "Toss choice"},
-            title="Toss winners increasingly choose to field — stacked count by season",
-        )
-        fig.update_layout(margin=dict(l=10, r=10, t=65, b=10), height=300)
+            JOIN matches x ON x.match_id = m.match_id
+            WHERE m.result = 'win' AND {WHERE}
+            GROUP BY margin_type
+        """, PARAMS).dropna(subset=["margin_type"])
+        fig = px.bar(margins, x="margin_type", y="matches", text="matches",
+                     labels={"margin_type": "Winning method", "matches": "Matches"})
+        st.markdown("**Wins by runs vs wins by wickets**")
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("n = matches in the selected season(s)")
+
+    # ---- chart 5: toss decision by season ----
+    with col3:
+        toss = q(f"""
+            SELECT m.season_year, m.toss_decision, COUNT(*) AS matches
+            FROM matches_clean m
+            WHERE {WHERE}
+            GROUP BY m.season_year, m.toss_decision
+            ORDER BY m.season_year
+        """, PARAMS)
+        fig = px.bar(toss, x="season_year", y="matches", color="toss_decision",
+                     barmode="stack",
+                     labels={"season_year": "Season", "matches": "Matches",
+                             "toss_decision": "Toss choice"})
+        st.markdown("**What toss winners choose, by season**")
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # =============================================================================
@@ -518,323 +252,171 @@ with overview_tab:
 # =============================================================================
 with match_tab:
     st.subheader("Match — one game at a time")
+    st.caption("The match list below follows the Season and Team filters in the sidebar.")
 
-    detail_seasons = q(
-        "SELECT DISTINCT season_year FROM matches_clean ORDER BY season_year"
-    )["season_year"].astype(int).tolist()
+    matches = q(f"""
+        SELECT m.match_id, m.season_year, m.team1, m.team2, m.venue_clean
+        FROM matches_clean m
+        WHERE {WHERE}
+        ORDER BY m.season_year, m.match_id
+    """, PARAMS)
 
-    d1, d2 = st.columns(2)
-    with d1:
-        selected_season = st.selectbox(
-            "Season filter — matches_clean.season_year",
-            detail_seasons,
-            index=len(detail_seasons) - 1,
-        )
+    # A readable label for each match, mapped back to its id.
+    labels = {
+        f"{r.team1} vs {r.team2} — {r.venue_clean} ({r.season_year})": r.match_id
+        for r in matches.itertuples()
+    }
+    chosen = st.selectbox("Pick a match", list(labels.keys()))
+    match_id = int(labels[chosen])
 
-    teams_df = q(
-        """
-    SELECT DISTINCT team
-    FROM (
-        SELECT team1 AS team FROM matches_clean
-        UNION
-        SELECT team2 AS team FROM matches_clean
-    )
-    WHERE team IS NOT NULL
-    AND TRIM(team) <> ''
-    ORDER BY team
-        """
-    )
-    team_options = ["All teams"] + teams_df["team"].tolist()
+    info = q("""
+        SELECT m.venue_clean, m.city_clean, m.result, m.match_winner,
+               m.player_of_match, m.toss_winner, m.toss_decision,
+               x.win_by_runs, x.win_by_wickets
+        FROM matches_clean m
+        JOIN matches x ON x.match_id = m.match_id
+        WHERE m.match_id = ?
+    """, (match_id,)).iloc[0]
 
-    with d2:
-        selected_team = st.selectbox(
-            "Team filter — matches_clean.team1 / team2",
-            team_options,
-        )
-
-    # Parameterized match-list query. The visible label is human-readable.
-    if selected_team == "All teams":
-        match_rows = q(
-            """
-            SELECT match_id, season_year, team1, team2, venue_clean, city_clean
-            FROM matches_clean
-            WHERE season_year = ?
-            ORDER BY match_id
-            """,
-            (selected_season,),
-        )
-    else:
-        match_rows = q(
-            """
-            SELECT match_id, season_year, team1, team2, venue_clean, city_clean
-            FROM matches_clean
-            WHERE season_year = ?
-              AND (team1 = ? OR team2 = ?)
-            ORDER BY match_id
-            """,
-            (selected_season, selected_team, selected_team),
-        )
-
-    if match_rows.empty:
-        st.warning("No matches are available for this season/team selection.")
-        st.stop()
-
-    match_rows["label"] = match_rows.apply(
-        lambda r: f"{r['team1']} vs {r['team2']} — {r['venue_clean']} ({as_int(r['season_year'])})",
-        axis=1,
-    )
-    label_to_id = dict(zip(match_rows["label"], match_rows["match_id"]))
-
-    selected_label = st.selectbox(
-        "Match selector — narrowed by the two filters above",
-        list(label_to_id.keys()),
-    )
-    selected_match_id = int(label_to_id[selected_label])
-
-    # -------------------------------------------------------------------------
-    # Match cards
-    # -------------------------------------------------------------------------
-    match_info = q(
-        """
-        SELECT c.match_id,
-               c.season_year,
-               c.venue_clean,
-               c.city_clean,
-               c.team1,
-               c.team2,
-               c.result,
-               c.match_winner,
-               c.player_of_match,
-               c.toss_winner,
-               c.toss_decision,
-               m.win_by_runs,
-               m.win_by_wickets
-        FROM matches_clean c
-        JOIN matches m ON m.match_id = c.match_id
-        WHERE c.match_id = ?
-        """,
-        (selected_match_id,),
-    ).iloc[0]
-
-    innings = q(
-        """
-        SELECT innings, batting_team, runs, wickets, legal_balls
+    innings = q("""
+        SELECT innings, batting_team, runs, wickets
         FROM v_innings
         WHERE match_id = ?
         ORDER BY innings
-        """,
-        (selected_match_id,),
-    )
+    """, (match_id,))
+    team_of = dict(zip(innings["innings"], innings["batting_team"]))   # innings number -> team
 
-    first = innings[innings["innings"] == 1]
-    second = innings[innings["innings"] == 2]
-
-    def innings_text(frame):
-        if frame.empty:
+    def score_text(n):
+        row = innings[innings["innings"] == n]
+        if row.empty:
             return "Not played"
-        r = frame.iloc[0]
-        return f"{r['batting_team']}: {as_int(r['runs'])}/{as_int(r['wickets'])}"
+        r = row.iloc[0]
+        return f"{r['batting_team']}: {int(r['runs'])}/{int(r['wickets'])}"
 
-    if match_info["result"] == "win":
-        if match_info["win_by_runs"] and match_info["win_by_runs"] > 0:
-            result_text = f" {match_info['match_winner']} won by {as_int(match_info['win_by_runs'])} runs"
-        else:
-            result_text = f" {match_info['match_winner']} won by {as_int(match_info['win_by_wickets'])} wickets"
+    # Result sentence
+    if info["result"] == "win" and info["win_by_runs"] and info["win_by_runs"] > 0:
+        result_text = f"{info['match_winner']} won by {int(info['win_by_runs'])} runs"
+    elif info["result"] == "win" and info["win_by_wickets"] and info["win_by_wickets"] > 0:
+        result_text = f"{info['match_winner']} won by {int(info['win_by_wickets'])} wickets"
     else:
-        result_text = str(match_info["result"]).title() if match_info["result"] else "No result"
+        result_text = str(info["result"]).title() if info["result"] else "No result"
 
+    # st.markdown is used (not st.metric) so long team names are never cut off.
     a, b, c = st.columns(3)
-    with a:
-        render_stat("Result", result_text)
-    with b:
-        render_stat("First innings", innings_text(first))
-    with c:
-        render_stat("Second innings", innings_text(second))
+    a.markdown(f"**Result**\n\n{result_text}")
+    b.markdown(f"**First innings**\n\n{score_text(1)}")
+    c.markdown(f"**Second innings**\n\n{score_text(2)}")
     st.caption(
-        f"Ground: {match_info['venue_clean']} · City: {match_info['city_clean']} · "
-        f"Toss: {match_info['toss_winner']} chose to {match_info['toss_decision']} · "
-        f"Player of the match: {match_info['player_of_match'] or 'Not recorded'}"
+        f"Ground: {info['venue_clean']} · City: {info['city_clean']} · "
+        f"Toss: {info['toss_winner']} chose to {info['toss_decision']} · "
+        f"Player of the match: {info['player_of_match'] or 'Not recorded'}"
     )
 
-    # -------------------------------------------------------------------------
-    # Visual 1 — HERO: runs per over
-    # -------------------------------------------------------------------------
-    runs_over = q(
-        """
-        SELECT innings,
-               over_number + 1 AS over_number,
-               SUM(total_runs) AS runs
+    # ---- chart 1: runs per over (hero) ----
+    runs_over = q("""
+        SELECT innings, over_number + 1 AS over_number, SUM(total_runs) AS runs
         FROM v_ball
-        WHERE match_id = ?
-          AND innings IN (1,2)
+        WHERE match_id = ? AND innings IN (1, 2)
         GROUP BY innings, over_number
         ORDER BY innings, over_number
-        """,
-        (selected_match_id,),
-    )
+    """, (match_id,))
+    runs_over["team"] = runs_over["innings"].map(team_of)
 
-    innings_team_map = dict(zip(innings["innings"], innings["batting_team"]))
-    runs_over["team"] = runs_over["innings"].map(innings_team_map)
-
-    fig = px.line(
-        runs_over,
-        x="over_number",
-        y="runs",
-        color="team",
-        markers=True,
+    fig_over = px.line(
+        runs_over, x="over_number", y="runs", color="team", markers=True,
         labels={"over_number": "Over", "runs": "Runs in over", "team": "Batting team"},
-        title="The match turned over by over — runs per over for both innings",
     )
-    fig.update_layout(margin=dict(l=20, r=20, t=65, b=20), height=430)
 
-    # -------------------------------------------------------------------------
-    # Visual 2 — fours and sixes
-    # -------------------------------------------------------------------------
-    boundaries = q(
-        """
+    # ---- chart 2: fours and sixes ----
+    boundaries = q("""
         SELECT innings,
                SUM(CASE WHEN batter_runs = 4 THEN 1 ELSE 0 END) AS fours,
-               SUM(CASE WHEN batter_runs = 6 THEN 1 ELSE 0 END) AS sixes,
-               COUNT(*) AS balls
+               SUM(CASE WHEN batter_runs = 6 THEN 1 ELSE 0 END) AS sixes
         FROM v_ball
-        WHERE match_id = ?
-          AND innings IN (1,2)
+        WHERE match_id = ? AND innings IN (1, 2)
         GROUP BY innings
         ORDER BY innings
-        """,
-        (selected_match_id,),
-    )
-    boundaries["team"] = boundaries["innings"].map(innings_team_map)
+    """, (match_id,))
+    boundaries["team"] = boundaries["innings"].map(team_of)
     boundary_long = boundaries.melt(
-        id_vars=["innings", "team", "balls"],
-        value_vars=["fours", "sixes"],
-        var_name="boundary",
-        value_name="count",
+        id_vars=["innings", "team"], value_vars=["fours", "sixes"],
+        var_name="boundary", value_name="count",
     )
-
-    fig_boundaries = px.bar(
-        boundary_long,
-        x="team",
-        y="count",
-        color="boundary",
-        barmode="group",
-        text="count",
+    fig_bound = px.bar(
+        boundary_long, x="team", y="count", color="boundary", barmode="group", text="count",
         labels={"team": "Batting team", "count": "Boundaries", "boundary": "Type"},
-        title="Runs came from different boundary mixes — fours and sixes by innings",
     )
-    fig_boundaries.update_layout(margin=dict(l=20, r=20, t=65, b=20), height=430)
 
-    hero_col, support_col = st.columns([2, 1])
-    with hero_col:
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"n = {len(runs_over)} innings-over observations across the selected match")
-    with support_col:
-        st.plotly_chart(fig_boundaries, use_container_width=True)
-        st.caption(
-            "n = "
-            + ", ".join(f"{r.team}: {as_int(r.balls)} balls" for r in boundaries.itertuples())
-        )
+    left, right = st.columns([2, 1])
+    with left:
+        st.markdown("**Runs per over for both innings**")
+        st.plotly_chart(fig_over, use_container_width=True)
+    with right:
+        st.markdown("**Fours and sixes by innings**")
+        st.plotly_chart(fig_bound, use_container_width=True)
 
-    # -------------------------------------------------------------------------
-    # Context row — three visuals
-    # -------------------------------------------------------------------------
     st.divider()
-    c1, c2, c3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
 
-    # Visual 3 — top run scorers and wicket takers table
-    with c1:
-        batters = q(
-            """
-            SELECT batter,
-                   SUM(batter_runs) AS runs,
-                   SUM(CASE WHEN is_legal = 1 THEN 1 ELSE 0 END) AS legal_balls
+    # ---- table: top run-scorers and wicket-takers ----
+    with col1:
+        batters = q("""
+            SELECT batter, SUM(batter_runs) AS runs, SUM(is_legal) AS balls
             FROM v_ball
             WHERE match_id = ?
             GROUP BY batter
-            ORDER BY runs DESC, legal_balls DESC
+            ORDER BY runs DESC, balls DESC
             LIMIT 5
-            """,
-            (selected_match_id,),
-        )
-        bowlers = q(
-            """
-            SELECT bowler,
-                   SUM(bowler_wicket) AS wickets,
-                   SUM(is_legal) AS legal_balls,
-                   SUM(bowler_runs) AS runs_conceded
+        """, (match_id,))
+        bowlers = q("""
+            SELECT bowler, SUM(bowler_wicket) AS wickets, SUM(bowler_runs) AS runs_conceded
             FROM v_ball
             WHERE match_id = ?
             GROUP BY bowler
             ORDER BY wickets DESC, runs_conceded ASC
             LIMIT 5
-            """,
-            (selected_match_id,),
-        )
-
+        """, (match_id,))
         st.markdown("**Top run-scorers**")
-        st.dataframe(batters[["batter", "runs", "legal_balls"]], hide_index=True, use_container_width=True)
+        st.dataframe(batters, hide_index=True, use_container_width=True)
         st.markdown("**Top wicket-takers**")
-        st.dataframe(bowlers[["bowler", "wickets", "legal_balls"]], hide_index=True, use_container_width=True)
-        st.caption("Top 5 in each list; the table is calculated only for the selected match.")
+        st.dataframe(bowlers, hide_index=True, use_container_width=True)
 
-    # Visual 4 — phase split
-    with c2:
-        phase = q(
-            """
-            SELECT innings,
-                   phase,
-                   SUM(total_runs) AS runs,
-                   SUM(is_wicket) AS wickets,
-                   SUM(is_legal) AS legal_balls
+    # ---- chart 4: runs by phase ----
+    with col2:
+        phase = q("""
+            SELECT innings, phase, SUM(total_runs) AS runs
             FROM v_ball
-            WHERE match_id = ?
-              AND innings IN (1,2)
+            WHERE match_id = ? AND innings IN (1, 2)
             GROUP BY innings, phase
             ORDER BY innings,
                      CASE phase WHEN 'Powerplay' THEN 1 WHEN 'Middle' THEN 2 ELSE 3 END
-            """,
-            (selected_match_id,),
-        )
-        phase["team"] = phase["innings"].map(innings_team_map)
+        """, (match_id,))
+        phase["team"] = phase["innings"].map(team_of)
         fig_phase = px.bar(
-            phase,
-            x="phase",
-            y="runs",
-            color="team",
-            barmode="group",
+            phase, x="phase", y="runs", color="team", barmode="group",
             labels={"phase": "Innings phase", "runs": "Runs", "team": "Batting team"},
-            title="Where each innings scored its runs — phase split",
         )
-        fig_phase.update_layout(margin=dict(l=10, r=10, t=65, b=10), height=420)
+        st.markdown("**Where each innings scored its runs**")
         st.plotly_chart(fig_phase, use_container_width=True)
-        st.caption("n = legal balls shown in each phase in the selected match")
 
-    # Visual 5 — wickets by over
-    with c3:
-        wickets = q(
-            """
-            SELECT innings,
-                   over_number + 1 AS over_number,
-                   SUM(bowler_wicket) AS wickets
+    # ---- chart 5: wickets by over ----
+    with col3:
+        wickets = q("""
+            SELECT innings, over_number + 1 AS over_number, SUM(bowler_wicket) AS wickets
             FROM v_ball
-            WHERE match_id = ?
-              AND innings IN (1,2)
+            WHERE match_id = ? AND innings IN (1, 2)
             GROUP BY innings, over_number
             HAVING SUM(bowler_wicket) > 0
             ORDER BY innings, over_number
-            """,
-            (selected_match_id,),
-        )
-        wickets["team"] = wickets["innings"].map(innings_team_map)
-        fig_wickets = px.bar(
-            wickets,
-            x="over_number",
-            y="wickets",
-            color="team",
-            barmode="group",
-            labels={"over_number": "Over", "wickets": "Credited wickets", "team": "Bowling context"},
-            title="Wickets came at these points in the match — by over",
-        )
-        fig_wickets.update_layout(margin=dict(l=10, r=10, t=65, b=10), height=420)
-        st.plotly_chart(fig_wickets, use_container_width=True)
-        st.caption("n = overs in which at least one bowler-credited wicket fell")
+        """, (match_id,))
+        st.markdown("**When the wickets fell**")
+        if wickets.empty:
+            st.info("No bowler-credited wickets in this match.")
+        else:
+            wickets["team"] = wickets["innings"].map(team_of)
+            fig_w = px.bar(
+                wickets, x="over_number", y="wickets", color="team", barmode="group",
+                labels={"over_number": "Over", "wickets": "Wickets", "team": "Batting team"},
+            )
+            fig_w.update_yaxes(dtick=1)
+            st.plotly_chart(fig_w, use_container_width=True)
